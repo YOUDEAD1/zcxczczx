@@ -313,34 +313,10 @@ async def engine_autopost_loop(client, owner_id):
                     continue
 
                 # -----------------------------------------------
-                # منطق اختيار الصورة المناسبة
+                # إرسال كل الصور مع بعض في رسالة واحدة
                 # -----------------------------------------------
                 media_files = config.get('media_files', [])
-                media_mode = config.get('media_mode', 'rotate')
-                selected_media = None
-
-                if media_files:
-                    # تصفية الملفات الموجودة فعلياً على القرص
-                    existing_files = [f for f in media_files if os.path.exists(f)]
-
-                    if existing_files:
-                        if media_mode == "rotate":
-                            idx = config.get('current_media_index', 0)
-                            # التأكد أن الفهرس ضمن النطاق
-                            idx = idx % len(existing_files)
-                            selected_media = existing_files[idx]
-                            # تحديث الفهرس للصورة التالية في الدورة
-                            next_idx = (idx + 1) % len(existing_files)
-                            await autopost_config_collection.update_one(
-                                {"owner_id": owner_id},
-                                {"$set": {"current_media_index": next_idx}}
-                            )
-                        elif media_mode == "random":
-                            selected_media = random.choice(existing_files)
-                        elif media_mode == "fixed":
-                            idx = config.get('current_media_index', 0)
-                            idx = min(idx, len(existing_files) - 1)
-                            selected_media = existing_files[idx]
+                existing_files = [f for f in media_files if os.path.exists(f)]
                 # -----------------------------------------------
 
                 # فحص رادار المشرفين
@@ -365,20 +341,25 @@ async def engine_autopost_loop(client, owner_id):
                     continue
 
                 try:
-                    if selected_media and os.path.exists(selected_media):
-                        sent_message = await client.send_message(
+                    if existing_files:
+                        # إرسال كل الصور مع النص في رسالة واحدة (album)
+                        sent_messages = await client.send_message(
                             int(group_id),
                             config['message'],
-                            file=selected_media,
+                            file=existing_files,
                             parse_mode='html'
                         )
+                        # حفظ id أول رسالة من الألبوم
+                        first_msg = sent_messages[0] if isinstance(sent_messages, list) else sent_messages
+                        last_published_message_ids[f"{owner_id}_{group_id}"] = first_msg.id
                     else:
+                        # بدون صور — نص فقط
                         sent_message = await client.send_message(
                             int(group_id),
                             config['message'],
                             parse_mode='html'
                         )
-                    last_published_message_ids[f"{owner_id}_{group_id}"] = sent_message.id
+                        last_published_message_ids[f"{owner_id}_{group_id}"] = sent_message.id
                     await asyncio.sleep(5)
                 except FloodWaitError as f:
                     await asyncio.sleep(f.seconds)
@@ -554,7 +535,7 @@ async def callback_handler(event):
     elif data == b"menu_autopost":
         conf = await autopost_config_collection.find_one({"owner_id": chat_id})
         media_count = len(conf.get('media_files', [])) if conf else 0
-        media_mode  = conf.get('media_mode', '—') if conf else '—'
+        status = "🟢 يعمل" if conf and conf.get('active') else "🔴 متوقف"
         btns = [
             [Button.inline("⚙️ إعداد جديد", b"setup_post")],
             [Button.inline("⏯️ تشغيل/إيقاف", b"toggle_post")],
@@ -563,12 +544,12 @@ async def callback_handler(event):
             [Button.inline("👁️ عرض المنشور", b"view_current_post")],
             [Button.inline("🔙 رجوع", b"back_home")]
         ]
-        status_txt = (
+        await event.respond(
             f"📢 **النشر التلقائي**\n"
-            f"📸 عدد الصور المحفوظة: `{media_count}`\n"
-            f"🔄 وضع الصور: `{media_mode}`"
+            f"الحالة: {status}\n"
+            f"📸 عدد الصور: `{media_count}` (تُرسل كلها معاً)",
+            buttons=btns
         )
-        await event.respond(status_txt, buttons=btns)
 
     elif data == b"view_current_post":
         conf = await autopost_config_collection.find_one({"owner_id": chat_id})
@@ -603,12 +584,12 @@ async def callback_handler(event):
         btns = [
             [Button.inline(f"➕ إضافة صور ({count} محفوظة)", b"add_more_media")],
             [Button.inline("🗑️ حذف كل الصور", b"delete_all_media")],
-            [Button.inline("🔄 تغيير وضع العرض", b"change_media_mode")],
             [Button.inline("🔙 رجوع", b"menu_autopost")]
         ]
         await event.respond(
             f"🖼️ **إدارة الصور**\n"
-            f"الصور الموجودة: `{count}`",
+            f"الصور الموجودة: `{count}`\n"
+            f"_(كل الصور تُرسل معاً في كل نشرة)_",
             buttons=btns
         )
 
@@ -639,18 +620,8 @@ async def callback_handler(event):
             )
         await event.respond("🗑️ **تم حذف جميع الصور.**")
 
-    elif data == b"change_media_mode":
-        await event.respond(
-            "🔄 **اختر وضع عرض الصور:**",
-            buttons=[
-                [Button.inline("🔁 بالترتيب (Rotate)", b"media_mode_rotate")],
-                [Button.inline("🎲 عشوائي (Random)", b"media_mode_random")],
-                [Button.inline("📌 صورة محددة دائماً", b"media_mode_fixed")]
-            ]
-        )
-
     # ----------------------------------------------------------------
-    # زر "تم إضافة الصور" — بعد إرسال الصور
+    # زر "تم إضافة الصور"
     # ----------------------------------------------------------------
     elif data == b"done_adding_media":
         tmp = temporary_autopost_config.get(chat_id, {})
@@ -671,82 +642,19 @@ async def callback_handler(event):
             user_current_state[chat_id] = None
             await event.respond(
                 f"✅ **تمت إضافة {len(new_files)} صورة.**\n"
-                f"إجمالي الصور: `{len(all_files)}`"
+                f"إجمالي الصور: `{len(all_files)}` (تُرسل كلها معاً في كل نشرة)"
             )
         else:
-            # هذا ضمن تدفق الإعداد الجديد — انتقل لاختيار الوضع
+            # ضمن الإعداد الجديد — انتقل مباشرة للوقت
             count = len(new_files)
-            if count == 0:
-                # بدون صور، انتقل مباشرة لاختيار الوقت
-                user_current_state[chat_id] = "WAITING_POST_TIME"
-                await event.respond("⏱️ **الخطوة 2/3 — كم دقيقة بين كل نشر؟**")
-            else:
-                await event.respond(
-                    f"✅ **تم حفظ {count} صورة.**\n\n"
-                    f"🔄 **الخطوة 2/3 — اختر طريقة عرض الصور:**",
-                    buttons=[
-                        [Button.inline("🔁 بالترتيب (Rotate)", b"media_mode_rotate")],
-                        [Button.inline("🎲 عشوائي (Random)", b"media_mode_random")],
-                        [Button.inline("📌 صورة محددة دائماً", b"media_mode_fixed")]
-                    ]
-                )
-
-    # ----------------------------------------------------------------
-    # اختيار وضع الصور
-    # ----------------------------------------------------------------
-    elif data in [b"media_mode_rotate", b"media_mode_random", b"media_mode_fixed"]:
-        mode = data.decode().split("_")[2]  # rotate / random / fixed
-
-        if chat_id not in temporary_autopost_config:
-            temporary_autopost_config[chat_id] = {}
-        temporary_autopost_config[chat_id]['media_mode'] = mode
-
-        if mode == "fixed":
-            # اعرض الصور ليختار الثابتة
-            files = temporary_autopost_config.get(chat_id, {}).get('media_files', [])
-            if not files:
-                conf = await autopost_config_collection.find_one({"owner_id": chat_id})
-                files = conf.get('media_files', []) if conf else []
-
-            if not files:
-                user_current_state[chat_id] = "WAITING_POST_TIME"
-                await event.respond("⏱️ **كم دقيقة بين كل نشر؟**")
-            else:
-                btns = [[Button.inline(f"📸 صورة {i + 1}", f"pick_media_{i}".encode())]
-                        for i in range(len(files))]
-                await event.respond("🔢 **اختر رقم الصورة الثابتة:**", buttons=btns)
-        else:
-            if temporary_autopost_config.get(chat_id, {}).get('adding_to_existing'):
-                # تحديث وضع الصور في DB مباشرة
-                await autopost_config_collection.update_one(
-                    {"owner_id": chat_id},
-                    {"$set": {"media_mode": mode}}
-                )
-                user_current_state[chat_id] = None
-                await event.respond(f"✅ **تم تغيير الوضع إلى: {mode}**")
-            else:
-                user_current_state[chat_id] = "WAITING_POST_TIME"
-                await event.respond(f"✅ **وضع الصور: {mode}**\n\n⏱️ **كم دقيقة بين كل نشر؟**")
-
-    elif data.decode().startswith("pick_media_"):
-        index = int(data.decode().split("_")[2])
-        if chat_id not in temporary_autopost_config:
-            temporary_autopost_config[chat_id] = {}
-        temporary_autopost_config[chat_id]['media_index'] = index
-
-        adding = temporary_autopost_config.get(chat_id, {}).get('adding_to_existing', False)
-        if adding:
-            await autopost_config_collection.update_one(
-                {"owner_id": chat_id},
-                {"$set": {"media_mode": "fixed", "current_media_index": index}}
-            )
-            user_current_state[chat_id] = None
-            await event.respond(f"✅ **ستُستخدم الصورة {index + 1} دائماً.**")
-        else:
             user_current_state[chat_id] = "WAITING_POST_TIME"
-            await event.respond(
-                f"✅ **ستُستخدم الصورة {index + 1} دائماً.**\n\n"
-                f"⏱️ **كم دقيقة بين كل نشر؟**"
+            if count > 0:
+                await event.respond(
+                    f"✅ **تم حفظ {count} صورة** (ستُرسل كلها معاً في كل نشرة)\n\n"
+                    f"⏱️ **الخطوة 2/3 — كم دقيقة بين كل نشر؟**"
+                )
+            else:
+                await event.respond("⏱️ **الخطوة 2/3 — كم دقيقة بين كل نشر؟**"
             )
 
     # ----------------------------------------------------------------
@@ -860,8 +768,6 @@ async def input_message_handler(event):
         temporary_autopost_config[chat_id] = {
             'msg': html_msg,
             'media_files': [],
-            'media_mode': 'rotate',
-            'media_index': 0,
             'adding_to_existing': False
         }
         user_current_state[chat_id] = "WAITING_POST_MEDIA"
@@ -1013,6 +919,8 @@ async def save_autopost_final(event):
         await event.respond("❌ اختر جروباً واحداً على الأقل")
         return
 
+    media_count = len(d.get('media_files', []))
+
     await autopost_config_collection.update_one(
         {"owner_id": chat_id},
         {"$set": {
@@ -1020,19 +928,15 @@ async def save_autopost_final(event):
             "interval": d.get('time', 30),
             "groups": d['groups'],
             "media_files": d.get('media_files', []),
-            "media_mode": d.get('media_mode', 'rotate'),
-            "current_media_index": d.get('media_index', 0),
             "active": True
         }},
         upsert=True
     )
     await manage_user_autopost_task(active_userbot_clients[chat_id], chat_id)
 
-    media_count = len(d.get('media_files', []))
     await event.respond(
         f"✅ **تم الحفظ وبدء النشر!**\n\n"
-        f"📸 الصور: `{media_count}`\n"
-        f"🔄 الوضع: `{d.get('media_mode', 'rotate')}`\n"
+        f"📸 الصور: `{media_count}` (تُرسل كلها معاً)\n"
         f"⏱️ كل `{d.get('time', 30)}` دقيقة\n"
         f"📢 الجروبات: `{len(d['groups'])}`"
     )
