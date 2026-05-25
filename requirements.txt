@@ -1,0 +1,10 @@
+telethon
+motor
+aiohttp
+openai
+python-dotenv
+certifi
+fpdf
+arabic-reshaper
+python-bidi
+requests
